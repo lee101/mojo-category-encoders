@@ -92,14 +92,14 @@ class OrdinalEncoder(BaseEncoder):
     @staticmethod
     def _positions(series: pd.Series, mapping: pd.Series):
         keys = [value for value in mapping.index if not pd.isna(value)]
-        missing_mask = pd.isna(series).to_numpy()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", pd.errors.Pandas4Warning)
             positions = pd.Categorical(series, categories=keys).codes.astype(np.int64)
         lookup = mapping.loc[keys].to_numpy(dtype=np.float64)
         missing_rows = mapping.index.isna()
         if missing_rows.any():
-            positions[missing_mask] = -2
+            if (positions == -1).any():
+                positions[pd.isna(series).to_numpy()] = -2
             missing = float(mapping[missing_rows].iloc[0])
         else:
             missing = np.nan
@@ -109,6 +109,7 @@ class OrdinalEncoder(BaseEncoder):
         frame = self._transform_setup(X)
         if not self.cols:
             return self._return(frame, override_return_df)
+
         for item in self.mapping:
             col = item["col"]
             positions, lookup, mapped_missing = self._positions(frame[col], item["mapping"])

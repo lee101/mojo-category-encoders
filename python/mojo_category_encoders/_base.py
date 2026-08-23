@@ -58,7 +58,7 @@ def categorical_columns(frame: pd.DataFrame) -> list:
 
 class BaseEncoder(BaseEstimator, TransformerMixin):
     def _fit_setup(self, X, y=None, supervised: bool = False):
-        frame = convert_input(X, deep=True)
+        frame = convert_input(X, deep=False)
         target = convert_target(y, frame.index) if supervised else None
         if supervised and target.isna().any():
             raise ValueError("The target column y must not contain missing values.")
@@ -101,14 +101,19 @@ class BaseEncoder(BaseEstimator, TransformerMixin):
         self._check_missing(frame)
         return frame
 
-    def _finish_fit(self, frame: pd.DataFrame, generated: list):
-        transformed = self.transform(frame, override_return_df=True)
+    def _finish_fit(
+        self, frame: pd.DataFrame, generated: list, output_columns: Sequence | None = None
+    ):
         self.invariant_cols = []
-        if self.drop_invariant:
-            self.invariant_cols = [
-                col for col in generated if transformed[col].nunique() <= 1
-            ]
-            transformed = transformed.drop(columns=self.invariant_cols)
+        if not self.drop_invariant:
+            columns = frame.columns if output_columns is None else output_columns
+            self.feature_names_out_ = np.asarray(columns)
+            return
+        transformed = self.transform(frame, override_return_df=True)
+        self.invariant_cols = [
+            col for col in generated if transformed[col].nunique() <= 1
+        ]
+        transformed = transformed.drop(columns=self.invariant_cols)
         self.feature_names_out_ = transformed.columns.to_numpy()
 
     def _return(self, frame: pd.DataFrame, override_return_df: bool):

@@ -356,6 +356,42 @@ def test_target_apply_simd_tail():
     np.testing.assert_array_equal(got, expected)
 
 
+def test_apply_serial_and_parallel_thresholds(monkeypatch):
+    codes = np.tile(np.arange(-3, 11, dtype=np.int64), 15001)
+    mapping = np.arange(13, dtype=np.float64) + 0.5
+    monkeypatch.setattr(_lib, "_APPLY_PARALLEL_THRESHOLD", codes.size + 1)
+    serial_target = _lib.target_apply(codes, mapping, -7.0)
+    serial_ordinal = _lib.ordinal_apply(codes, mapping, -8.0, -9.0)
+    monkeypatch.setattr(_lib, "_APPLY_PARALLEL_THRESHOLD", 1)
+    np.testing.assert_array_equal(
+        _lib.target_apply(codes, mapping, -7.0), serial_target
+    )
+    np.testing.assert_array_equal(
+        _lib.ordinal_apply(codes, mapping, -8.0, -9.0), serial_ordinal
+    )
+
+
+def test_target_stats_simd_initialization_tail():
+    codes = np.array([-3, -2, -1, 0, 0, 3, 10, 11], dtype=np.int64)
+    target = np.arange(codes.size, dtype=np.float64) + 0.25
+    counts, sums = _lib.target_stats(codes, target, 13)
+    expected_counts = np.zeros(13, dtype=np.int64)
+    expected_sums = np.zeros(13, dtype=np.float64)
+    for code, value in zip(codes, target, strict=True):
+        group = int(code) + 2
+        if 0 <= group < 13:
+            expected_counts[group] += 1
+            expected_sums[group] += value
+    np.testing.assert_array_equal(counts, expected_counts)
+    np.testing.assert_array_equal(sums, expected_sums)
+
+
+def test_transform_does_not_modify_input(mixed):
+    original = mixed.copy(deep=True)
+    mojo.OrdinalEncoder(cols=["city", "tier"]).fit(mixed).transform(mixed)
+    assert_frame_equal(mixed, original)
+
+
 def test_native_wrappers_validate_shapes_ranges_and_empty_buffers():
     assert _lib.ordinal_apply([], [], -1.0, -2.0).shape == (0,)
     np.testing.assert_array_equal(

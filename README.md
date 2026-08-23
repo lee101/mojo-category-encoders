@@ -78,14 +78,21 @@ sides so the comparison measures the kernels rather than process-pool startup.
 
 | case | Mojo (ms) | upstream (ms) | upstream / Mojo | result |
 |---|---:|---:|---:|---|
-| OrdinalEncoder.transform (1M x 4, k=1k) | 750.6 | 930.7 | 1.24x | faster |
-| TargetEncoder.fit_transform (1M x 3, k=1k) | 3799.9 | 3248.0 | 0.85x | slower |
-| TargetEncoder.transform (1M x 3, k=1k) | 694.0 | 826.0 | 1.19x | faster |
-| HashingEncoder MD5 (250k x 4, 32 buckets) | 1925.3 | 5028.8 | 2.61x | faster |
+| OrdinalEncoder.transform (1M x 4, k=1k) | 535.1 | 700.5 | 1.31x | faster |
+| TargetEncoder.fit_transform (1M x 3, k=1k) | 853.7 | 2663.1 | 3.12x | faster |
+| TargetEncoder.transform (1M x 3, k=1k) | 378.0 | 614.2 | 1.62x | faster |
+| HashingEncoder MD5 (250k x 4, 32 buckets) | 456.5 | 4796.6 | 10.51x | faster |
 
 These are end-to-end estimator timings, not isolated native-kernel timings.
 Performance varies by workload and system load; the table reports the final
-run directly, including the slower target fit case.
+run directly.
+
+No GPU path is included. The ordinal and target application kernels are
+memory-bound indexed lookups with well under two operations per byte moved, so
+host/device transfer cannot be justified. MD5 has higher arithmetic intensity,
+but the optimized end-to-end CPU path is already 10.51x faster than upstream in
+the measured workload; it was deliberately left alone rather than adding a GPU
+path to a case already more than 5x ahead.
 
 ## How it works
 
@@ -99,6 +106,8 @@ Ordinal and target codes are contiguous `int64`; target values and mappings are
 contiguous `float64`; hashing receives one packed UTF-8 byte buffer plus `int64`
 offset and length arrays. Outputs use row-major layout. Target and ordinal
 application use native-width SIMD loads and stores with scalar remainder loops.
+Large application buffers are split into independent 64K chunks and processed
+in parallel above a runtime threshold; small arrays stay serial.
 Hash output initialization is also SIMD, while independent hashing and row
 accumulation switch to host-threaded native slices only above their measured
 size thresholds. The MD5 implementation computes the exact 128-bit digest

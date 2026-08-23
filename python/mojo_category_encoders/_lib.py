@@ -20,14 +20,15 @@ F = ctypes.c_double
 _SIGNATURES = {
     "mce_hash_md5_buckets": ([I] * 8, None),
     "mce_hash_accumulate": ([I] * 6, None),
-    "mce_ordinal_apply": ([I, I, I, I, I, F, F], None),
+    "mce_ordinal_apply": ([I, I, I, I, I, F, F, I], None),
     "mce_target_stats": ([I, I, I, I, I, I], None),
-    "mce_target_apply": ([I, I, I, I, I, F], None),
+    "mce_target_apply": ([I, I, I, I, I, F, I], None),
 }
 
 _lib: ctypes.CDLL | None = None
 _HASH_PARALLEL_THRESHOLD = 4096
 _ACCUMULATE_PARALLEL_THRESHOLD = 65536
+_APPLY_PARALLEL_THRESHOLD = 262144
 _MAX_WORKERS = min(8, os.cpu_count() or 1)
 
 
@@ -195,7 +196,7 @@ def ordinal_apply(
     native_lookup = lookup if lookup.size else np.zeros(1, dtype=np.float64)
     lib().mce_ordinal_apply(
         addr(positions), addr(native_lookup), addr(result), positions.size, lookup.size,
-        unknown, missing,
+        unknown, missing, _APPLY_PARALLEL_THRESHOLD,
     )
     return result
 
@@ -230,6 +231,7 @@ def target_apply(codes: np.ndarray, mapping: np.ndarray, default: float) -> np.n
         return result
     native_mapping = mapping if mapping.size else np.zeros(1, dtype=np.float64)
     lib().mce_target_apply(
-        addr(codes), addr(native_mapping), addr(result), codes.size, mapping.size, default
+        addr(codes), addr(native_mapping), addr(result), codes.size, mapping.size, default,
+        _APPLY_PARALLEL_THRESHOLD,
     )
     return result

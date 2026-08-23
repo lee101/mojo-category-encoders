@@ -56,7 +56,8 @@ class HashingEncoder(BaseEncoder):
     def fit(self, X, y=None, **kwargs):
         frame, _ = self._fit_setup(X)
         generated = [f"col_{i}" for i in range(self.n_components)]
-        self._finish_fit(frame, generated)
+        remaining = [col for col in frame.columns if col not in self.cols]
+        self._finish_fit(frame, generated, generated + remaining)
         return self
 
     @staticmethod

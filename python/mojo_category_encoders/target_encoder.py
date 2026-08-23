@@ -57,14 +57,20 @@ class TargetEncoder(BaseEncoder):
             handle_unknown="value",
             handle_missing="value",
         ).fit(frame)
-        ordinal = self.ordinal_encoder.transform(frame, override_return_df=True)
         self.mapping = {}
         self._dense_mapping = {}
         self._position_mapping = {}
         self._category_keys = {}
         for item in self.ordinal_encoder.category_mapping:
             col = item["col"]
-            codes = np.ascontiguousarray(ordinal[col], dtype=np.int64)
+            positions, _, mapped_missing = OrdinalEncoder._positions(
+                frame[col], item["mapping"]
+            )
+            codes = positions
+            known = codes >= 0
+            codes[known] += 1
+            if mapped_missing != -2 and (codes == -2).any():
+                codes[codes == -2] = int(mapped_missing)
             groups = max(3, int(codes.max(initial=-2)) + 3)
             counts, sums = _lib.target_stats(codes, values, groups)
             dense = np.full(
@@ -121,7 +127,7 @@ class TargetEncoder(BaseEncoder):
             codes = pd.Categorical(
                 series, categories=self._category_keys[col]
             ).codes.astype(np.int64)
-            if series.hasnans:
+            if (codes == -1).any():
                 codes[series.isna().to_numpy()] = -2
             if self.handle_unknown == "error" and (codes == -1).any():
                 raise ValueError("Unexpected categories found in dataframe")

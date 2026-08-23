@@ -1,5 +1,6 @@
 """Dense kernels for category encoders, exposed through a C ABI."""
 
+from max.algorithm import parallelize
 from std.sys import simd_width_of
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
@@ -185,34 +186,46 @@ def mce_ordinal_apply(
     lookup_len: Int,
     unknown_value: Float64,
     missing_value: Float64,
+    parallel_threshold: Int,
 ) abi("C"):
     var positions = IPtr(unsafe_from_address=positions_addr)
     var lookup = FPtr(unsafe_from_address=lookup_addr)
     var result = FPtr(unsafe_from_address=result_addr)
-    comptime W = simd_width_of[DType.float64]()
-    var i = 0
-    while i + W <= n:
-        var position_vec = positions.unsafe_load[width=W](i)
-        var result_vec = SIMD[DType.float64, W](0.0)
-        comptime for lane in range(W):
-            var code = Int(position_vec[lane])
+    @__parameter
+    def apply_chunk(chunk: Int):
+        comptime W = simd_width_of[DType.float64]()
+        var begin = chunk * 65536
+        var end = min(begin + 65536, n)
+        var i = begin
+        while i + W <= end:
+            var position_vec = positions.unsafe_load[width=W](i)
+            var result_vec = SIMD[DType.float64, W](0.0)
+            comptime for lane in range(W):
+                var code = Int(position_vec[lane])
+                if code >= 0 and code < lookup_len:
+                    result_vec[lane] = lookup[unsafe_offset=code]
+                elif code == -2:
+                    result_vec[lane] = missing_value
+                else:
+                    result_vec[lane] = unknown_value
+            result.unsafe_store(i, result_vec)
+            i += W
+        while i < end:
+            var code = Int(positions[unsafe_offset=i])
             if code >= 0 and code < lookup_len:
-                result_vec[lane] = lookup[unsafe_offset=code]
+                result[unsafe_offset=i] = lookup[unsafe_offset=code]
             elif code == -2:
-                result_vec[lane] = missing_value
+                result[unsafe_offset=i] = missing_value
             else:
-                result_vec[lane] = unknown_value
-        result.unsafe_store(i, result_vec)
-        i += W
-    while i < n:
-        var code = Int(positions[unsafe_offset=i])
-        if code >= 0 and code < lookup_len:
-            result[unsafe_offset=i] = lookup[unsafe_offset=code]
-        elif code == -2:
-            result[unsafe_offset=i] = missing_value
-        else:
-            result[unsafe_offset=i] = unknown_value
-        i += 1
+                result[unsafe_offset=i] = unknown_value
+            i += 1
+
+    var chunks = (n + 65535) // 65536
+    if n >= parallel_threshold:
+        parallelize[apply_chunk](chunks, min(chunks, 8))
+    else:
+        for chunk in range(chunks):
+            apply_chunk(chunk)
 
 
 @export("mce_target_stats")
@@ -228,14 +241,23 @@ def mce_target_stats(
     var target = FPtr(unsafe_from_address=target_addr)
     var counts = IPtr(unsafe_from_address=counts_addr)
     var sums = FPtr(unsafe_from_address=sums_addr)
-    for i in range(groups):
+    comptime W = simd_width_of[DType.float64]()
+    var i = 0
+    var zero_counts = SIMD[DType.int64, W](0)
+    var zero_sums = SIMD[DType.float64, W](0.0)
+    while i + W <= groups:
+        counts.unsafe_store(i, zero_counts)
+        sums.unsafe_store(i, zero_sums)
+        i += W
+    while i < groups:
         counts[unsafe_offset=i] = 0
         sums[unsafe_offset=i] = 0.0
-    for i in range(n):
-        var group = Int(codes[unsafe_offset=i]) + 2
+        i += 1
+    for row in range(n):
+        var group = Int(codes[unsafe_offset=row]) + 2
         if group >= 0 and group < groups:
             counts[unsafe_offset=group] += 1
-            sums[unsafe_offset=group] += target[unsafe_offset=i]
+            sums[unsafe_offset=group] += target[unsafe_offset=row]
 
 
 @export("mce_target_apply")
@@ -246,6 +268,7 @@ def mce_target_apply(
     n: Int,
     mapping_len: Int,
     default_value: Float64,
+    parallel_threshold: Int,
 ) abi("C"):
     var codes = IPtr(unsafe_from_address=codes_addr)
     var mapping = FPtr(unsafe_from_address=mapping_addr)
@@ -275,5 +298,9 @@ def mce_target_apply(
             )
             i += 1
 
-    for chunk in range((n + 65535) // 65536):
-        apply_chunk(chunk)
+    var chunks = (n + 65535) // 65536
+    if n >= parallel_threshold:
+        parallelize[apply_chunk](chunks, min(chunks, 8))
+    else:
+        for chunk in range(chunks):
+            apply_chunk(chunk)
