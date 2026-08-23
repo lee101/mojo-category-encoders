@@ -2,10 +2,10 @@
 
 from std.sys import simd_width_of
 
-comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
-comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
-comptime U32Ptr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
+comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
+comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
+comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
+comptime U32Ptr = Pointer[UInt32, AnyOrigin[mut=True]]
 
 
 @always_inline
@@ -16,7 +16,7 @@ def rotl32(value: UInt32, bits: UInt32) -> UInt32:
 @always_inline
 def padded_byte(data: BPtr, start: Int, n: Int, pos: Int, total: Int) -> UInt8:
     if pos < n:
-        return data[start + pos]
+        return data[unsafe_offset=start + pos]
     if pos == n:
         return UInt8(0x80)
     if pos >= total - 8:
@@ -72,7 +72,10 @@ def md5_bucket(
             var previous_d = d
             d = c
             c = b
-            b += rotl32(a + f + constants[i] + word, shifts[i])
+            b += rotl32(
+                a + f + constants[unsafe_offset=i] + word,
+                shifts[unsafe_offset=i],
+            )
             a = previous_d
 
         a0 += a
@@ -81,14 +84,16 @@ def md5_bucket(
         d0 += d
 
     var remainder = 0
-    var state = InlineArray[UInt32, 4](fill=0)
-    state[0] = a0
-    state[1] = b0
-    state[2] = c0
-    state[3] = d0
     for word_i in range(4):
+        var word = a0
+        if word_i == 1:
+            word = b0
+        elif word_i == 2:
+            word = c0
+        elif word_i == 3:
+            word = d0
         for byte_i in range(4):
-            var byte = UInt8(state[word_i] >> UInt32(byte_i * 8))
+            var byte = UInt8(word >> UInt32(byte_i * 8))
             remainder = (remainder * 256 + Int(byte)) % components
     return remainder
 
@@ -111,13 +116,18 @@ def mce_hash_md5_buckets(
     var constants = U32Ptr(unsafe_from_address=constants_addr)
     var buckets = IPtr(unsafe_from_address=buckets_addr)
 
-    @parameter
+    @__parameter
     def hash_chunk(chunk: Int):
         var begin = chunk * 256
         var end = min(begin + 256, count)
         for i in range(begin, end):
-            buckets[i] = Int64(md5_bucket(
-                data, Int(starts[i]), Int(lengths[i]), components, shifts, constants
+            buckets[unsafe_offset=i] = Int64(md5_bucket(
+                data,
+                Int(starts[unsafe_offset=i]),
+                Int(lengths[unsafe_offset=i]),
+                components,
+                shifts,
+                constants,
             ))
 
     for chunk in range((count + 255) // 256):
@@ -130,10 +140,10 @@ def zero_i64(result: IPtr, n: Int):
     var i = 0
     var zeros = SIMD[DType.int64, W](0)
     while i + W <= n:
-        result.store(i, zeros)
+        result.unsafe_store(i, zeros)
         i += W
     while i < n:
-        result[i] = 0
+        result[unsafe_offset=i] = 0
         i += 1
 
 
@@ -151,14 +161,16 @@ def mce_hash_accumulate(
     var result = IPtr(unsafe_from_address=result_addr)
     zero_i64(result, rows * components)
 
-    @parameter
+    @__parameter
     def accumulate_row(row: Int):
         var code_base = row * columns
         var result_base = row * components
         for column in range(columns):
-            var code = Int(codes[code_base + column])
+            var code = Int(codes[unsafe_offset=code_base + column])
             if code >= 0:
-                result[result_base + Int(buckets[code])] += 1
+                result[
+                    unsafe_offset=result_base + Int(buckets[unsafe_offset=code])
+                ] += 1
 
     for row in range(rows):
         accumulate_row(row)
@@ -180,26 +192,26 @@ def mce_ordinal_apply(
     comptime W = simd_width_of[DType.float64]()
     var i = 0
     while i + W <= n:
-        var position_vec = positions.load[width=W](i)
+        var position_vec = positions.unsafe_load[width=W](i)
         var result_vec = SIMD[DType.float64, W](0.0)
         comptime for lane in range(W):
             var code = Int(position_vec[lane])
             if code >= 0 and code < lookup_len:
-                result_vec[lane] = lookup[code]
+                result_vec[lane] = lookup[unsafe_offset=code]
             elif code == -2:
                 result_vec[lane] = missing_value
             else:
                 result_vec[lane] = unknown_value
-        result.store(i, result_vec)
+        result.unsafe_store(i, result_vec)
         i += W
     while i < n:
-        var code = Int(positions[i])
+        var code = Int(positions[unsafe_offset=i])
         if code >= 0 and code < lookup_len:
-            result[i] = lookup[code]
+            result[unsafe_offset=i] = lookup[unsafe_offset=code]
         elif code == -2:
-            result[i] = missing_value
+            result[unsafe_offset=i] = missing_value
         else:
-            result[i] = unknown_value
+            result[unsafe_offset=i] = unknown_value
         i += 1
 
 
@@ -217,13 +229,13 @@ def mce_target_stats(
     var counts = IPtr(unsafe_from_address=counts_addr)
     var sums = FPtr(unsafe_from_address=sums_addr)
     for i in range(groups):
-        counts[i] = 0
-        sums[i] = 0.0
+        counts[unsafe_offset=i] = 0
+        sums[unsafe_offset=i] = 0.0
     for i in range(n):
-        var group = Int(codes[i]) + 2
+        var group = Int(codes[unsafe_offset=i]) + 2
         if group >= 0 and group < groups:
-            counts[group] += 1
-            sums[group] += target[i]
+            counts[unsafe_offset=group] += 1
+            sums[unsafe_offset=group] += target[unsafe_offset=i]
 
 
 @export("mce_target_apply")
@@ -239,25 +251,25 @@ def mce_target_apply(
     var mapping = FPtr(unsafe_from_address=mapping_addr)
     var result = FPtr(unsafe_from_address=result_addr)
 
-    @parameter
+    @__parameter
     def apply_chunk(chunk: Int):
         comptime W = simd_width_of[DType.float64]()
         var begin = chunk * 65536
         var end = min(begin + 65536, n)
         var i = begin
         while i + W <= end:
-            var code_vec = codes.load[width=W](i)
+            var code_vec = codes.unsafe_load[width=W](i)
             var result_vec = SIMD[DType.float64, W](default_value)
             comptime for lane in range(W):
                 var group = Int(code_vec[lane]) + 2
                 if group >= 0 and group < mapping_len:
-                    result_vec[lane] = mapping[group]
-            result.store(i, result_vec)
+                    result_vec[lane] = mapping[unsafe_offset=group]
+            result.unsafe_store(i, result_vec)
             i += W
         while i < end:
-            var group = Int(codes[i]) + 2
-            result[i] = (
-                mapping[group]
+            var group = Int(codes[unsafe_offset=i]) + 2
+            result[unsafe_offset=i] = (
+                mapping[unsafe_offset=group]
                 if group >= 0 and group < mapping_len
                 else default_value
             )
