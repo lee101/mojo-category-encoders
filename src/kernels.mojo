@@ -2,6 +2,8 @@
 
 from std.sys import simd_width_of
 
+from max.algorithm import parallelize
+
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
@@ -134,6 +136,101 @@ def mce_hash_md5_buckets(
         hash_chunk(chunk)
 
 
+@always_inline
+def hash_buckets_range(
+    data: BPtr,
+    starts: IPtr,
+    lengths: IPtr,
+    shifts: U32Ptr,
+    constants: U32Ptr,
+    buckets: IPtr,
+    components: Int,
+    begin: Int,
+    end: Int,
+):
+    for i in range(begin, end):
+        buckets[unsafe_offset=i] = Int64(md5_bucket(
+            data,
+            Int(starts[unsafe_offset=i]),
+            Int(lengths[unsafe_offset=i]),
+            components,
+            shifts,
+            constants,
+        ))
+
+
+def hash_buckets(
+    data: BPtr,
+    starts: IPtr,
+    lengths: IPtr,
+    shifts: U32Ptr,
+    constants: U32Ptr,
+    buckets: IPtr,
+    count: Int,
+    components: Int,
+    workers: Int,
+    chunk: Int,
+):
+    """Hash `count` distinct keys.
+
+    `workers` is the measured, worker-count-capped value chosen on the Python
+    side; it is normalised again here because `workers <= 1` folds at comptime
+    when compared against a literal `1` (see MOJO_NOTES sections 4 and 8).
+    """
+    var n = Int(count)
+    var w = Int(workers)
+    if w < 2 or n < 2 * Int(chunk):
+        hash_buckets_range(data, starts, lengths, shifts, constants, buckets, components, 0, n)
+        return
+    if w > 16:
+        w = 16
+    var c = Int(chunk)
+    var chunks = (n + c - 1) // c
+
+    def work(k: Int) {imm}:
+        var begin = Int(k) * c
+        hash_buckets_range(
+            data,
+            starts,
+            lengths,
+            shifts,
+            constants,
+            buckets,
+            components,
+            begin,
+            min(begin + c, n),
+        )
+
+    parallelize(work, chunks, w)
+
+
+@export("mce_hash_md5_buckets_parallel")
+def mce_hash_md5_buckets_parallel(
+    data_addr: Int,
+    starts_addr: Int,
+    lengths_addr: Int,
+    shifts_addr: Int,
+    constants_addr: Int,
+    buckets_addr: Int,
+    count: Int,
+    components: Int,
+    workers: Int,
+    chunk: Int,
+) abi("C"):
+    hash_buckets(
+        BPtr(unsafe_from_address=data_addr),
+        IPtr(unsafe_from_address=starts_addr),
+        IPtr(unsafe_from_address=lengths_addr),
+        U32Ptr(unsafe_from_address=shifts_addr),
+        U32Ptr(unsafe_from_address=constants_addr),
+        IPtr(unsafe_from_address=buckets_addr),
+        count,
+        components,
+        workers,
+        chunk,
+    )
+
+
 def ordinal_apply_range(
     positions: IPtr,
     lookup: FPtr,
@@ -212,6 +309,91 @@ def mce_hash_accumulate(
         accumulate_row(row)
 
 
+@always_inline
+def accumulate_range(
+    codes: IPtr,
+    buckets: IPtr,
+    result: IPtr,
+    columns: Int,
+    components: Int,
+    begin: Int,
+    end: Int,
+):
+    for row in range(begin, end):
+        var code_base = row * columns
+        var result_base = row * components
+        for column in range(columns):
+            var code = Int(codes[unsafe_offset=code_base + column])
+            if code >= 0:
+                result[
+                    unsafe_offset=result_base + Int(buckets[unsafe_offset=code])
+                ] += 1
+
+
+def hash_accumulate(
+    codes: IPtr,
+    buckets: IPtr,
+    result: IPtr,
+    rows: Int,
+    columns: Int,
+    components: Int,
+    workers: Int,
+    chunk: Int,
+):
+    """Zero the row-major result, then accumulate one histogram row per input row.
+
+    Every row owns a disjoint slice of `result`, so rows are independent. The
+    zero-fill stays serial; only the scatter is spread over workers.
+    """
+    zero_i64(result, rows * components)
+    var n = Int(rows)
+    var w = Int(workers)
+    if w < 2 or n < 2 * Int(chunk):
+        accumulate_range(codes, buckets, result, columns, components, 0, n)
+        return
+    if w > 16:
+        w = 16
+    var c = Int(chunk)
+    var chunks = (n + c - 1) // c
+
+    def work(k: Int) {imm}:
+        var begin = Int(k) * c
+        accumulate_range(
+            codes,
+            buckets,
+            result,
+            columns,
+            components,
+            begin,
+            min(begin + c, n),
+        )
+
+    parallelize(work, chunks, w)
+
+
+@export("mce_hash_accumulate_parallel")
+def mce_hash_accumulate_parallel(
+    codes_addr: Int,
+    buckets_addr: Int,
+    result_addr: Int,
+    rows: Int,
+    columns: Int,
+    components: Int,
+    workers: Int,
+    chunk: Int,
+) abi("C"):
+    hash_accumulate(
+        IPtr(unsafe_from_address=codes_addr),
+        IPtr(unsafe_from_address=buckets_addr),
+        IPtr(unsafe_from_address=result_addr),
+        rows,
+        columns,
+        components,
+        workers,
+        chunk,
+    )
+
+
 @export("mce_ordinal_apply")
 def mce_ordinal_apply(
     positions_addr: Int,
@@ -226,8 +408,20 @@ def mce_ordinal_apply(
     var positions = IPtr(unsafe_from_address=positions_addr)
     var lookup = FPtr(unsafe_from_address=lookup_addr)
     var result = FPtr(unsafe_from_address=result_addr)
-    var chunks = (n + 65535) // 65536
     _ = parallel_threshold
+    ordinal_apply(positions, lookup, result, n, lookup_len, unknown_value, missing_value)
+
+
+def ordinal_apply(
+    positions: IPtr,
+    lookup: FPtr,
+    result: FPtr,
+    n: Int,
+    lookup_len: Int,
+    unknown_value: Float64,
+    missing_value: Float64,
+):
+    var chunks = (n + 65535) // 65536
     for chunk in range(chunks):
         var begin = chunk * 65536
         var end = min(begin + 65536, n)
@@ -241,6 +435,48 @@ def mce_ordinal_apply(
             begin,
             end,
         )
+
+
+@export("mce_ordinal_apply_parallel")
+def mce_ordinal_apply_parallel(
+    positions_addr: Int,
+    lookup_addr: Int,
+    result_addr: Int,
+    n: Int,
+    lookup_len: Int,
+    unknown_value: Float64,
+    missing_value: Float64,
+    workers: Int,
+    chunk: Int,
+) abi("C"):
+    var positions = IPtr(unsafe_from_address=positions_addr)
+    var lookup = FPtr(unsafe_from_address=lookup_addr)
+    var result = FPtr(unsafe_from_address=result_addr)
+    var w = Int(workers)
+    var c = Int(chunk)
+    var count = Int(n)
+    if w < 2 or count < 2 * c:
+        ordinal_apply(positions, lookup, result, count, lookup_len, unknown_value, missing_value)
+        return
+    if w > 16:
+        w = 16
+    var chunks = (count + c - 1) // c
+
+    def work(k: Int) {imm}:
+        var begin = Int(k) * c
+        var end = min(begin + c, count)
+        ordinal_apply_range(
+            positions,
+            lookup,
+            result,
+            lookup_len,
+            unknown_value,
+            missing_value,
+            begin,
+            end,
+        )
+
+    parallelize(work, chunks, w)
 
 
 @export("mce_target_stats")
@@ -319,7 +555,18 @@ def mce_target_apply(
     var mapping = FPtr(unsafe_from_address=mapping_addr)
     var result = FPtr(unsafe_from_address=result_addr)
     _ = parallel_threshold
+    _target_apply_serial(codes, mapping, result, n, mapping_len, default_value)
 
+
+@always_inline
+def _target_apply_serial(
+    codes: IPtr,
+    mapping: FPtr,
+    result: FPtr,
+    n: Int,
+    mapping_len: Int,
+    default_value: Float64,
+):
     var chunks = (n + 65535) // 65536
     for chunk in range(chunks):
         var begin = chunk * 65536
@@ -327,3 +574,38 @@ def mce_target_apply(
         target_apply_range(
             codes, mapping, result, mapping_len, default_value, begin, end
         )
+
+
+@export("mce_target_apply_parallel")
+def mce_target_apply_parallel(
+    codes_addr: Int,
+    mapping_addr: Int,
+    result_addr: Int,
+    n: Int,
+    mapping_len: Int,
+    default_value: Float64,
+    workers: Int,
+    chunk: Int,
+) abi("C"):
+    var codes = IPtr(unsafe_from_address=codes_addr)
+    var mapping = FPtr(unsafe_from_address=mapping_addr)
+    var result = FPtr(unsafe_from_address=result_addr)
+    var w = Int(workers)
+    var c = Int(chunk)
+    var count = Int(n)
+    if w < 2 or count < 2 * c:
+        _target_apply_serial(codes, mapping, result, count, mapping_len, default_value)
+        return
+    if w > 16:
+        w = 16
+    var chunks = (count + c - 1) // c
+
+    def work(k: Int) {imm}:
+        var begin = Int(k) * c
+        var end = min(begin + c, count)
+        target_apply_range(
+            codes, mapping, result, mapping_len, default_value, begin, end
+        )
+
+    parallelize(work, chunks, w)
+

@@ -94,6 +94,42 @@ Do NOT write `from std.algorithm import parallelize` — it does not compile. If
 port is serial where it could be parallel, that is a real gap, not a toolchain
 excuse; use the `max` form behind a size threshold and prove it with the benchmark.
 
+### 4a. What a `parallelize` call actually costs (measured, 1.2.0)
+
+- **A launch with >=2 workers costs a flat ~5ms inside the shared library**, before
+  any work runs. Probe: 1 no-op chunk -> 5.03ms; 4 chunks -> 4.74ms; 64 -> 6.43ms;
+  256 -> 5.96ms. Workers 2/4/8/16 were all ~5.3-6.1ms. A first call in a fresh
+  process showed ~7.5ms; steady state after warm-up is ~5ms.
+  So parallelism only pays for kernels whose serial form costs **well over 5ms**:
+  find that size with a benchmark, then put the threshold above it.
+- **1 worker is genuinely serial and ~free** (sub-microsecond), so passing
+  `workers=1` from the host is a working fallback, but prefer an explicit serial
+  branch.
+- **Do not parallelise through Python.** `ThreadPoolExecutor` over ctypes calls did
+  not help this port's kernels: 2-4 native calls cost ~1.4-1.9ms of launch plus GIL
+  contention, and the split only beat serial above ~1M elements (~1.8x), far less
+  than in-kernel `parallelize`. In-process threading also nests badly under a
+  worker pool the caller already owns.
+
+### 4b. A comptime trap that silently kills thresholds
+
+`if workers <= 1:` where `1` is a literal is folded at **comptime**, against
+`workers`'s type, not its runtime value. Both arms look fine and the serial arm
+never runs, so every call takes the parallel path and pays the ~5ms even for tiny
+inputs. Use an explicit cast in the comparison:
+
+```mojo
+if Int(workers) < 2:            # runtime comparison, correct
+    ...serial...
+    return
+parallelize(work, Int(chunks), Int(workers))
+```
+
+Also cast loop bounds (`while i < Int(chunks)`) and chunk arithmetic, for the same
+reason. Verify a threshold with a test that asserts the *small* input path gets the
+same answer — a dead branch is otherwise invisible.
+
+
 ## 5. GPU — the host API moved from `std.gpu` to `max.gpu`
 
 Same story as parallelism. The `std.gpu` module is gone entirely

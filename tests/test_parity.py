@@ -462,3 +462,94 @@ def test_fit_transform_and_input_feature_names(ours, theirs, y):
     np.testing.assert_array_equal(
         ours.get_feature_names_in(), theirs.get_feature_names_in()
     )
+
+
+# Serial vs parallel kernel paths. The Python thresholds are monkeypatched to
+# force each path, and the worker cap is varied to cover 1/2/4/8 threads.
+
+
+def _pin_serial(monkeypatch):
+    monkeypatch.setattr(_lib, "_APPLY_PARALLEL_THRESHOLD", 10**12)
+    monkeypatch.setattr(_lib, "_HASH_PARALLEL_THRESHOLD", 10**12)
+    monkeypatch.setattr(_lib, "_ACCUMULATE_PARALLEL_THRESHOLD", 10**12)
+
+
+def _pin_parallel(monkeypatch, workers):
+    monkeypatch.setattr(_lib, "_APPLY_PARALLEL_THRESHOLD", 1)
+    monkeypatch.setattr(_lib, "_HASH_PARALLEL_THRESHOLD", 1)
+    monkeypatch.setattr(_lib, "_ACCUMULATE_PARALLEL_THRESHOLD", 1)
+    monkeypatch.setattr(_lib, "_MAX_WORKERS", workers)
+
+
+def _apply_inputs():
+    rng = np.random.default_rng(11)
+    positions = rng.integers(-3, 13, size=200_001).astype(np.int64)
+    lookup = np.arange(13, dtype=np.float64) + 0.25
+    return positions, lookup
+
+
+def test_ordinal_apply_serial_equals_parallel(monkeypatch):
+    positions, lookup = _apply_inputs()
+    _pin_serial(monkeypatch)
+    serial = _lib.ordinal_apply(positions, lookup, -1.0, -2.0)
+    for workers in (1, 2, 4, 8):
+        _pin_parallel(monkeypatch, workers)
+        parallel = _lib.ordinal_apply(positions, lookup, -1.0, -2.0)
+        np.testing.assert_array_equal(parallel, serial)
+
+
+def test_target_apply_serial_equals_parallel(monkeypatch):
+    positions, lookup = _apply_inputs()
+    _pin_serial(monkeypatch)
+    serial = _lib.target_apply(positions, lookup, -7.0)
+    for workers in (1, 2, 4, 8):
+        _pin_parallel(monkeypatch, workers)
+        parallel = _lib.target_apply(positions, lookup, -7.0)
+        np.testing.assert_array_equal(parallel, serial)
+
+
+def test_hash_md5_serial_equals_parallel(monkeypatch):
+    rng = np.random.default_rng(5)
+    keys = np.array([f"v{value}" for value in rng.integers(0, 4000, 60_000)], dtype=object)
+    values = np.column_stack([keys, keys[::-1], np.full(keys.size, "same", dtype=object)])
+    _pin_serial(monkeypatch)
+    serial = _lib.hash_md5(values, 17)
+    mp = pytest.MonkeyPatch()
+    try:
+        for workers in (1, 2, 4, 8):
+            _pin_parallel(mp, workers)
+            parallel = _lib.hash_md5(values, 17)
+            np.testing.assert_array_equal(parallel, serial)
+    finally:
+        mp.undo()
+
+
+def test_hash_md5_parallel_matches_public_hashlib(monkeypatch):
+    values = np.array(
+        [[f"k{row}", None, "東京"] for row in range(3_000)], dtype=object
+    )
+    _pin_parallel(monkeypatch, 4)
+    got = _lib.hash_md5(values, 23)
+    expected = np.zeros((values.shape[0], 23), dtype=np.int64)
+    for row, items in enumerate(values):
+        for item in items:
+            if item is not None:
+                bucket = int.from_bytes(hashlib.md5(str(item).encode()).digest(), "big") % 23
+                expected[row, bucket] += 1
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_parallel_apply_kernel_takes_serial_branch_below_two_chunks(monkeypatch):
+    # Fewer than two chunks cannot be shared; the kernel must still be correct
+    # when handed a worker count it cannot use.
+    native = _lib.lib()
+    codes = np.arange(-3, 12, dtype=np.int64).repeat(10)
+    lookup = np.arange(13, dtype=np.float64) + 0.5
+    result = np.empty(codes.size, dtype=np.float64)
+    expected = _lib.target_apply(codes, lookup, 3.0)
+    native.mce_target_apply_parallel(
+        _lib.addr(codes), _lib.addr(lookup), _lib.addr(result),
+        codes.size, lookup.size, 3.0, 8, 65536,
+    )
+    np.testing.assert_array_equal(result, expected)
+
