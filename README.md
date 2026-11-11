@@ -116,6 +116,11 @@ shared). `pixi run bench-parallel`.
 | ordinal/target apply | 4 194 304 | 16.8ms | 10.8ms (4w) | Python threads -> `parallelize` |
 | ordinal/target apply | 8 388 608 | 34.5ms | 19.4ms (4w) | Python threads -> `parallelize` |
 
+The 2026-11-11 `pixi run bench-gpu` runs (same day; load average 13.2 then 27)
+measured `ordinal_apply` at 1.7 / 14.8-16.4 / 32.8-33.6ms serial for 1M / 4M / 8M
+elements and `hash_md5` at 188.4-196.0ms for 60k distinct keys and
+258.1-272.1ms for 1M rows over 1k keys, consistent with the table above.
+
 ### Thread-count sweep (1, 2, 4, cap)
 
 | kernel | size | 1w | 2w | 4w | 8w |
@@ -155,12 +160,191 @@ and parallel output on the same input for ordinal apply, target apply and MD5
 hashing at 1, 2, 4 and 8 workers, and checks the parallel hash against public
 `hashlib`.
 
-No GPU path is included. The ordinal and target application kernels are
-memory-bound indexed lookups with well under two operations per byte moved, so
-host/device transfer cannot be justified. MD5 has higher arithmetic intensity,
-but the optimized end-to-end CPU path is already 8.06x faster than upstream in
-the measured workload; it was deliberately left alone rather than adding a GPU
-path to a case already more than 5x ahead.
+## GPU
+
+**No GPU path is shipped, and all of it is CPU only: memory-bound.** This phase
+began as a gate: only a kernel above roughly 2 operations per byte moved was
+allowed onto the device. The named input, `bench/analysis.md`, does not exist in
+this repository (checked in the working tree and in every commit), so the numbers
+that gate depends on were measured here with `pixi run bench-gpu`, which records
+what it counted and how.
+
+Host: NVIDIA GeForce RTX 5090, 5 500 MiB free at the time of the gate
+(`nvidia-smi --query-gpu=memory.free`), so the 4 000 MiB floor was met and this
+phase was not skipped on that ground. Load average 13.2, shared host.
+
+### Gate: operations per byte
+
+Bytes are the ones that actually cross the device boundary per call, at the sizes
+the estimators pass (`bench/bench_gpu.py`); ops count integer ALU work in MD5's
+round body as one op per operation, the same currency as a flop.
+
+| kernel | work per call | bytes moved | ops/byte | verdict |
+|---|---|---:|---:|---|
+| MD5 hash + accumulate | 60k distinct keys, 1M x 1 rows, 32 buckets | 279 704 084 | 0.36 | CPU only: memory-bound |
+| ordinal/target apply | 4 194 304 elements | 67 116 864 | 0.19 | CPU only: memory-bound |
+| hash accumulation | 1M x 1 rows, 32 buckets | 276 824 320 | 0.01 | CPU only: memory-bound |
+
+All three are below the 2 ops/byte gate. The hashing call is the best candidate
+and is still 5.5x below it, because the dominant cost of a `HashingEncoder` call
+is not the MD5 rounds but the per-row result matrix: 1M rows x 32 `int64` counts
+is 268 MB of output that has to cross the bus and be zeroed, whether the hashing
+runs on the host or the device.
+
+### Second check: device round trip against the CPU kernels
+
+The gate decides the question, but the device cost was measured too, since "the
+hardware is idle" is not the test. `bench/gpu_probe.py` copies 512 KiB in,
+launches a no-op kernel and copies it back, with a fresh copy on every timed run
+(an earlier version of the probe warmed up the device and then timed only the
+sync, which reported a meaningless 0.004ms; it is fixed and re-measured here):
+
+| copy in | launch call | copy out | round trip |
+|---:|---:|---:|---:|
+| 0.047ms | 0.006ms | 0.060ms | 0.114ms |
+
+Repeated runs of the same probe gave 0.39ms and 1.87-2.17ms round trips, so
+treat 0.1-2.2ms as the range on this shared device rather than a constant. Even
+the slow end is small against 196ms of CPU work for the 60k-key hashing call
+(0.01x), so for hashing the bus is not the reason to stay on the CPU: the
+arithmetic is simply not dense enough per byte to gain. For the apply kernels,
+which take 1.7ms at 1M elements and 16.4ms at 4M, a round trip of up to 2.2ms
+would be a real fraction of every call, on a kernel already far below the gate.
+
+### Before and after, per kernel
+
+Measured 2026-11-11 on a 72-core Xeon E5-2697 v4, load average 13-26 (the host is
+shared). `pixi run bench-parallel`.
+
+| kernel | size | before | after | path before -> after |
+|---|---:|---:|---:|---|
+| MD5 hash pass, distinct keys | 32 768 | 30.2ms | 10.2ms (8w) | Python threads -> `parallelize` |
+| MD5 hash pass, distinct keys | 262 144 | 282.6ms | 96.6ms (4w) | Python threads -> `parallelize` |
+| MD5 row accumulation | 1M rows | 267ms | 265ms | Python threads -> `parallelize` |
+| ordinal/target apply | 262 144 | 0.41ms | 0.41ms (serial) | Python threads removed |
+| ordinal/target apply | 1 048 576 | 1.78ms | 1.78ms (serial) | Python threads removed |
+| ordinal/target apply | 4 194 304 | 16.8ms | 10.8ms (4w) | Python threads -> `parallelize` |
+| ordinal/target apply | 8 388 608 | 34.5ms | 19.4ms (4w) | Python threads -> `parallelize` |
+
+The 2026-11-11 `pixi run bench-gpu` runs (same day; load average 13.2 then 27)
+measured `ordinal_apply` at 1.7 / 14.8-16.4 / 32.8-33.6ms serial for 1M / 4M / 8M
+elements and `hash_md5` at 188.4-196.0ms for 60k distinct keys and
+258.1-272.1ms for 1M rows over 1k keys, consistent with the table above.
+
+### Thread-count sweep (1, 2, 4, cap)
+
+| kernel | size | 1w | 2w | 4w | 8w |
+|---|---:|---:|---:|---:|---:|
+| ordinal apply | 4 194 304 | 16.8ms | 14.7ms | 10.8ms | 9.0ms |
+| ordinal apply | 8 388 608 | 34.5ms | 25.4ms | 19.4ms | 12.7ms |
+| MD5 hash pass | 262 144 keys | 282.6ms | 152.6ms | 96.6ms | 58.8ms |
+
+The gain does **not** flatten at 4 for these two kernels when measured alone: 8
+threads was still 1.2-1.5x better than 4. The cap stays at 4 because the host is
+shared with production and the rules for this phase cap at 4 unless more is
+proven on a quiet machine; it was not. The accumulation stage did flatten: 1.19x
+at 4 threads and 1.19x at 8.
+
+### What was reverted
+
+- **Threaded application stages.** The previous code split the apply kernels
+  across a `ThreadPoolExecutor` and switched them on at 262 144 elements. That
+  *lost* to serial at every size real callers pass: 4-thread at 262k took 5.26ms
+  against 0.41ms serial (0.08x), and at 1M 5.27ms against 1.78ms (0.34x). The
+  threaded path is gone; the kernel now uses `parallelize` only from 16 777 216
+  elements (an 8M measured crossover, doubled as margin).
+- **Threaded row accumulation.** Its 65 536-row threshold was below the crossover.
+  Through the public API it measured 265ms at 1M rows against 267ms serial, i.e.
+  no win. It is disabled in the shipped thresholds. The export
+  `mce_hash_accumulate_parallel` still exists and is tested for correctness, but
+  the sizing logic was not settled, so it is not called.
+- **Python-side threading for hashing.** Replaced by `parallelize`. It also made
+  hashing slower end to end in this phase: the 250k x 4 hashing case went from
+  456.5ms to 504.5ms. Same machine, same harness, load average roughly 25 before
+  and 17 after, so treat that as a tentative regression rather than a clean
+  measurement; the isolated hash pass is 2.6x faster, but the end-to-end case
+  still projects slower than before.
+
+Results are identical to the serial path. `tests/test_parity.py` compares serial
+and parallel output on the same input for ordinal apply, target apply and MD5
+hashing at 1, 2, 4 and 8 workers, and checks the parallel hash against public
+`hashlib`.
+
+## GPU
+
+**No GPU path is shipped, and all of it is CPU only: memory-bound.** This phase
+began as a gate: only a kernel above roughly 2 operations per byte moved was
+allowed onto the device. The named input, `bench/analysis.md`, does not exist in
+this repository (checked in the working tree and in every commit), so the numbers
+that gate depends on were measured here with `pixi run bench-gpu`, which records
+what it counted and how.
+
+Host: NVIDIA GeForce RTX 5090, 5 500 MiB free at the time of the gate
+(`nvidia-smi --query-gpu=memory.free`), so the 4 000 MiB floor was met and this
+phase was not skipped on that ground. Load average 13.2, shared host.
+
+### Gate: operations per byte
+
+Bytes are the ones that actually cross the device boundary per call, at the sizes
+the estimators pass (`bench/bench_gpu.py`); ops count integer ALU work in MD5's
+round body as one op per operation, the same currency as a flop.
+
+| kernel | work per call | bytes moved | ops/byte | verdict |
+|---|---|---:|---:|---|
+| MD5 hash + accumulate | 60k distinct keys, 1M x 1 rows, 32 buckets | 279 704 084 | 0.36 | CPU only: memory-bound |
+| ordinal/target apply | 4 194 304 elements | 67 116 864 | 0.19 | CPU only: memory-bound |
+| hash accumulation | 1M x 1 rows, 32 buckets | 276 824 320 | 0.01 | CPU only: memory-bound |
+
+All three are below the 2 ops/byte gate. The hashing call is the best candidate
+and is still 5.5x below it, because the dominant cost of a `HashingEncoder` call
+is not the MD5 rounds but the per-row result matrix: 1M rows x 32 `int64` counts
+is 268 MB of output that has to cross the bus and be zeroed, whether the hashing
+runs on the host or the device.
+
+### Second check: device round trip against the CPU kernels
+
+The gate decides the question, but the device cost was measured too, since "the
+hardware is idle" is not the test. `bench/gpu_probe.py` copies 512 KiB in,
+launches a no-op kernel and copies it back:
+
+| copy in | launch call | round trip (in + launch + sync + out) |
+|---:|---:|---:|
+| 0.063ms | 0.008ms | 1.87ms (1.87-2.16ms across runs) |
+
+The 512 KiB copies themselves take 0.05-0.10ms; the 1.9-2.2ms round trip is
+dominated by the fixed cost of the first `synchronize()` after a launch on this
+shared device. Against 188ms of CPU work for the 60k-key hashing call that
+round trip is small (0.01x), so for hashing the bus is not the reason to stay on
+the CPU: the arithmetic is simply not dense enough per byte to gain. For the
+apply kernels, which take 1.7ms at 1M elements and 14.8ms at 4M, the same
+1.9-2.2ms round trip would be paid every call.
+
+### Before and after
+
+Nothing was changed, so there is no after. The shipped path is the CPU path from
+the Parallelism section; the numbers the GPU would have to beat are:
+
+| kernel | size real callers pass | CPU (ships) | device floor (measured) |
+|---|---:|---:|---:|
+| MD5 hash + accumulate | 60k keys + 1M rows | 196.0ms | 0.1-2.2ms round trip before any hashing |
+| MD5 hash + accumulate | 1M rows, 1k keys | 258.1ms | as above |
+| ordinal/target apply | 1 048 576 | 1.7ms | 0.1-2.2ms round trip alone |
+| ordinal/target apply | 4 194 304 | 16.4ms serial, 11.6ms at 4 workers | as above |
+
+Because no kernel passes the gate, no device kernel was added to
+`src/kernels.mojo`. The `max.gpu` path itself does work on this toolchain: the
+round-trip probe compiles and runs, so the gate result is about the kernels, not
+about a missing API. Details of the exact spellings this required (`block_idx.x`
+not `block_idx(0)`, `Int64` kernel parameters) are in `MOJO_NOTES.md` section 5b.
+
+### GPU tests
+
+`tests/test_gpu.py` carries the round-trip check and the CPU-only skip path. On a
+CPU-only host the device test **skips**: simulated here with a failing
+`nvidia-smi` stub first on `PATH`, the full suite ran `62 passed, 1 skipped`. On
+this host all 63 pass. The skip path itself is tested on every host, so a missing
+device cannot turn into a red suite. No estimator test needs a GPU, because there
+is no GPU code path to exercise.
 
 ## How it works
 

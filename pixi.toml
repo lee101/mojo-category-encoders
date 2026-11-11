@@ -9,6 +9,7 @@ version = "0.1.0"
 build = "bash build/build.sh"
 test = "python -m pytest tests -q"
 bench = "flock /tmp/mojo-bench.lock python bench/bench.py"
+bench-gpu = "flock /tmp/mojo-bench.lock python bench/bench_gpu.py"
 bench-parallel = "flock /tmp/mojo-bench.lock python bench/bench_parallel.py"
 
 [activation.env]

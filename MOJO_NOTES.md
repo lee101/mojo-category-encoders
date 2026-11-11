@@ -205,6 +205,42 @@ threshold.
 `DeviceContext()` construction needs a `raises` context, the value is not
 `Writable` (do not `print` it), and there is no `ctx.devices()`.
 
+**The index names are properties, not functions.** `block_idx(0)` fails with
+`'_BlockIdx' does not implement the '__call__' method`. Use `.x`:
+
+```mojo
+var i = Int64(block_idx.x * block_dim.x + thread_idx.x)   # 1-D launch
+ctx.enqueue_function[kernel](buf, Int64(n), grid_dim=64, block_dim=128)
+```
+
+**Kernel parameters must be `DevicePassable`.** A plain `Int` argument fails at
+instantiation with `Int and UInt do not conform to DevicePassable; use a fixed-width
+type such as Int32 or Int64 instead`. Type every scalar kernel parameter `Int64`
+(the host side passes `Int64(n)`), and compare inside the kernel against `Int64`
+operands — `if i < n` where one side is `Int64` and the other `Int` does not resolve.
+
+**Host buffers.** `ctx.enqueue_create_host_buffer[DType.float64](n)` returns a host
+buffer you can index directly; use it instead of hand-allocating
+(`DTypePointer` is not a builtin name in this dialect).
+
+**Timing a round trip needs the context warm first.** After the first
+`enqueue_function` + `synchronize()` in a process, a later `synchronize()` on its
+own returns in microseconds (measured 0.004ms), so a probe that warms up and then
+times only the sync reports nothing. Time the copy in, the launch and the copy
+out with a fresh copy inside each timed run; that gives 0.11ms to 2.2ms for a
+512 KiB round trip on the shared RTX 5090.
+
+Verified end to end on 1.2.0 with an RTX 5090: create buffer, copy in, launch,
+synchronize, copy back, values correct. `ctx.enqueue_copy(dst_host_buf, dev_buf)`
+works in that direction without naming the device buffer's type parameters.
+
+**Exporting a GPU wrapper through the C ABI.** An `abi("C")` function may not be
+`raises`, but `DeviceContext()` must be constructed in a `raises` context. Keep the
+export `non-raising` and confine the fallible construction to a small
+`raises` helper; catch device-construction and allocation failures *outside* the
+already-launched region, and never snapshot caller output before the launch, so a
+swallowed error cannot turn into a silent CPU fallback that returns stale data.
+
 One trap worth naming: `max`'s caching memory allocator can request a very large
 chunk (mojo-eigen's batched GPU SVD asks for 16.75 GiB and gets
 `CUDA_ERROR_OUT_OF_MEMORY`) and a broad `except` will swallow that into a silent
