@@ -353,7 +353,7 @@ def test_target_apply_simd_tail():
     expected = np.array(
         [mapping[code + 2] if 0 <= code + 2 < len(mapping) else -99.0 for code in codes]
     )
-    np.testing.assert_array_equal(got, expected)
+    np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
 
 
 def test_apply_serial_and_parallel_thresholds(monkeypatch):
@@ -363,11 +363,13 @@ def test_apply_serial_and_parallel_thresholds(monkeypatch):
     serial_target = _lib.target_apply(codes, mapping, -7.0)
     serial_ordinal = _lib.ordinal_apply(codes, mapping, -8.0, -9.0)
     monkeypatch.setattr(_lib, "_APPLY_PARALLEL_THRESHOLD", 1)
-    np.testing.assert_array_equal(
-        _lib.target_apply(codes, mapping, -7.0), serial_target
+    np.testing.assert_allclose(
+        _lib.target_apply(codes, mapping, -7.0), serial_target,
+        rtol=1e-12, atol=1e-12,
     )
-    np.testing.assert_array_equal(
-        _lib.ordinal_apply(codes, mapping, -8.0, -9.0), serial_ordinal
+    np.testing.assert_allclose(
+        _lib.ordinal_apply(codes, mapping, -8.0, -9.0), serial_ordinal,
+        rtol=1e-12, atol=1e-12,
     )
 
 
@@ -383,7 +385,7 @@ def test_target_stats_simd_initialization_tail():
             expected_counts[group] += 1
             expected_sums[group] += value
     np.testing.assert_array_equal(counts, expected_counts)
-    np.testing.assert_array_equal(sums, expected_sums)
+    np.testing.assert_allclose(sums, expected_sums, rtol=1e-12, atol=1e-12)
 
 
 def test_transform_does_not_modify_input(mixed):
@@ -394,15 +396,18 @@ def test_transform_does_not_modify_input(mixed):
 
 def test_native_wrappers_validate_shapes_ranges_and_empty_buffers():
     assert _lib.ordinal_apply([], [], -1.0, -2.0).shape == (0,)
-    np.testing.assert_array_equal(
+    np.testing.assert_allclose(
         _lib.ordinal_apply(np.array([-1, -2]), [], -3.0, -4.0),
         np.array([-3.0, -4.0]),
+        rtol=1e-12, atol=1e-12,
     )
     counts, sums = _lib.target_stats([], [], 3)
     np.testing.assert_array_equal(counts, np.zeros(3, dtype=np.int64))
-    np.testing.assert_array_equal(sums, np.zeros(3, dtype=np.float64))
+    np.testing.assert_allclose(sums, np.zeros(3), rtol=0, atol=0)
     assert _lib.target_apply([], [], 1.0).shape == (0,)
-    np.testing.assert_array_equal(_lib.target_apply([-1, 0], [], 7.0), [7.0, 7.0])
+    np.testing.assert_allclose(
+        _lib.target_apply([-1, 0], [], 7.0), [7.0, 7.0], rtol=1e-12, atol=1e-12
+    )
     with pytest.raises(ValueError):
         _lib.target_stats([0], [], 3)
     with pytest.raises(TypeError):

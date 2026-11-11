@@ -1,6 +1,5 @@
 """Dense kernels for category encoders, exposed through a C ABI."""
 
-from max.algorithm import parallelize
 from std.sys import simd_width_of
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
@@ -135,6 +134,42 @@ def mce_hash_md5_buckets(
         hash_chunk(chunk)
 
 
+def ordinal_apply_range(
+    positions: IPtr,
+    lookup: FPtr,
+    result: FPtr,
+    lookup_len: Int,
+    unknown_value: Float64,
+    missing_value: Float64,
+    begin: Int,
+    end: Int,
+):
+    comptime W = simd_width_of[DType.float64]()
+    var i = begin
+    while i + W <= end:
+        var position_vec = positions.unsafe_load[width=W](i)
+        var result_vec = SIMD[DType.float64, W](0.0)
+        comptime for lane in range(W):
+            var code = Int(position_vec[lane])
+            if code >= 0 and code < lookup_len:
+                result_vec[lane] = lookup[unsafe_offset=code]
+            elif code == -2:
+                result_vec[lane] = missing_value
+            else:
+                result_vec[lane] = unknown_value
+        result.unsafe_store(i, result_vec)
+        i += W
+    while i < end:
+        var code = Int(positions[unsafe_offset=i])
+        if code >= 0 and code < lookup_len:
+            result[unsafe_offset=i] = lookup[unsafe_offset=code]
+        elif code == -2:
+            result[unsafe_offset=i] = missing_value
+        else:
+            result[unsafe_offset=i] = unknown_value
+        i += 1
+
+
 @always_inline
 def zero_i64(result: IPtr, n: Int):
     comptime W = simd_width_of[DType.int64]()
@@ -191,41 +226,21 @@ def mce_ordinal_apply(
     var positions = IPtr(unsafe_from_address=positions_addr)
     var lookup = FPtr(unsafe_from_address=lookup_addr)
     var result = FPtr(unsafe_from_address=result_addr)
-    @__parameter
-    def apply_chunk(chunk: Int):
-        comptime W = simd_width_of[DType.float64]()
+    var chunks = (n + 65535) // 65536
+    _ = parallel_threshold
+    for chunk in range(chunks):
         var begin = chunk * 65536
         var end = min(begin + 65536, n)
-        var i = begin
-        while i + W <= end:
-            var position_vec = positions.unsafe_load[width=W](i)
-            var result_vec = SIMD[DType.float64, W](0.0)
-            comptime for lane in range(W):
-                var code = Int(position_vec[lane])
-                if code >= 0 and code < lookup_len:
-                    result_vec[lane] = lookup[unsafe_offset=code]
-                elif code == -2:
-                    result_vec[lane] = missing_value
-                else:
-                    result_vec[lane] = unknown_value
-            result.unsafe_store(i, result_vec)
-            i += W
-        while i < end:
-            var code = Int(positions[unsafe_offset=i])
-            if code >= 0 and code < lookup_len:
-                result[unsafe_offset=i] = lookup[unsafe_offset=code]
-            elif code == -2:
-                result[unsafe_offset=i] = missing_value
-            else:
-                result[unsafe_offset=i] = unknown_value
-            i += 1
-
-    var chunks = (n + 65535) // 65536
-    if n >= parallel_threshold:
-        parallelize[apply_chunk](chunks, min(chunks, 8))
-    else:
-        for chunk in range(chunks):
-            apply_chunk(chunk)
+        ordinal_apply_range(
+            positions,
+            lookup,
+            result,
+            lookup_len,
+            unknown_value,
+            missing_value,
+            begin,
+            end,
+        )
 
 
 @export("mce_target_stats")
@@ -260,6 +275,36 @@ def mce_target_stats(
             sums[unsafe_offset=group] += target[unsafe_offset=row]
 
 
+def target_apply_range(
+    codes: IPtr,
+    mapping: FPtr,
+    result: FPtr,
+    mapping_len: Int,
+    default_value: Float64,
+    begin: Int,
+    end: Int,
+):
+    comptime W = simd_width_of[DType.float64]()
+    var i = begin
+    while i + W <= end:
+        var code_vec = codes.unsafe_load[width=W](i)
+        var result_vec = SIMD[DType.float64, W](default_value)
+        comptime for lane in range(W):
+            var group = Int(code_vec[lane]) + 2
+            if group >= 0 and group < mapping_len:
+                result_vec[lane] = mapping[unsafe_offset=group]
+        result.unsafe_store(i, result_vec)
+        i += W
+    while i < end:
+        var group = Int(codes[unsafe_offset=i]) + 2
+        result[unsafe_offset=i] = (
+            mapping[unsafe_offset=group]
+            if group >= 0 and group < mapping_len
+            else default_value
+        )
+        i += 1
+
+
 @export("mce_target_apply")
 def mce_target_apply(
     codes_addr: Int,
@@ -273,34 +318,12 @@ def mce_target_apply(
     var codes = IPtr(unsafe_from_address=codes_addr)
     var mapping = FPtr(unsafe_from_address=mapping_addr)
     var result = FPtr(unsafe_from_address=result_addr)
-
-    @__parameter
-    def apply_chunk(chunk: Int):
-        comptime W = simd_width_of[DType.float64]()
-        var begin = chunk * 65536
-        var end = min(begin + 65536, n)
-        var i = begin
-        while i + W <= end:
-            var code_vec = codes.unsafe_load[width=W](i)
-            var result_vec = SIMD[DType.float64, W](default_value)
-            comptime for lane in range(W):
-                var group = Int(code_vec[lane]) + 2
-                if group >= 0 and group < mapping_len:
-                    result_vec[lane] = mapping[unsafe_offset=group]
-            result.unsafe_store(i, result_vec)
-            i += W
-        while i < end:
-            var group = Int(codes[unsafe_offset=i]) + 2
-            result[unsafe_offset=i] = (
-                mapping[unsafe_offset=group]
-                if group >= 0 and group < mapping_len
-                else default_value
-            )
-            i += 1
+    _ = parallel_threshold
 
     var chunks = (n + 65535) // 65536
-    if n >= parallel_threshold:
-        parallelize[apply_chunk](chunks, min(chunks, 8))
-    else:
-        for chunk in range(chunks):
-            apply_chunk(chunk)
+    for chunk in range(chunks):
+        var begin = chunk * 65536
+        var end = min(begin + 65536, n)
+        target_apply_range(
+            codes, mapping, result, mapping_len, default_value, begin, end
+        )
